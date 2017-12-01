@@ -3,51 +3,56 @@
 # A simple icmp ping tools.
 # Get more info http://www.s0nnet.com/archives/python-icmp
 # by s0nnet.
+# Modified by TuXinhang(tuxinhang@niwodai.net)
 
 
-import os 
-import argparse 
+import os
+import tornado.ioloop
+import threading
+import subprocess
+import logging
+import Queue
 import socket
 import struct
 import select
 import time
 
-
 ICMP_ECHO_REQUEST = 8 # Platform specific
 DEFAULT_TIMEOUT = 2
-DEFAULT_COUNT = 4 
+DEFAULT_COUNT = 4
+
+logger = logging.getLogger(__name__)
 
 
 class Pinger(object):
     """ Pings to a host -- the Pythonic way"""
-    
-    def __init__(self, target_host, count=DEFAULT_COUNT, timeout=DEFAULT_TIMEOUT):
-        self.target_host = target_host
+
+    def __init__(self, count=DEFAULT_COUNT, timeout=DEFAULT_TIMEOUT):
         self.count = count
         self.timeout = timeout
 
     def do_checksum(self, source_string):
         """  Verify the packet integritity """
         sum = 0
-        max_count = (len(source_string)/2)*2
+        max_count = (len(source_string) / 2) * 2
         count = 0
         while count < max_count:
-            val = ord(source_string[count + 1])*256 + ord(source_string[count])
+            val = ord(source_string[count + 1]) * 256 + ord(source_string[count])
             sum = sum + val
-            sum = sum & 0xffffffff 
+            sum = sum & 0xffffffff
             count = count + 2
-     
-        if max_count<len(source_string):
+
+        if max_count < len(source_string):
             sum = sum + ord(source_string[len(source_string) - 1])
-            sum = sum & 0xffffffff 
-     
+            sum = sum & 0xffffffff
+
         sum = (sum >> 16) + (sum & 0xffff)
         sum = sum + (sum >> 16)
         answer = ~sum
         answer = answer & 0xffff
         answer = answer >> 8 | (answer << 8 & 0xff00)
         return answer
- 
+
     def receive_pong(self, sock, ID, timeout):
         """
         Receive ping from the socket.
@@ -57,9 +62,9 @@ class Pinger(object):
             start_time = time.time()
             readable = select.select([sock], [], [], time_remaining)
             time_spent = (time.time() - start_time)
-            if not readable[0]: # Timeout
+            if not readable[0]:  # Timeout
                 return
-     
+
             time_received = time.time()
             recv_packet, addr = sock.recvfrom(1024)
             # print(struct.unpack("!bbHHHbbHII", recv_packet[:20]))
@@ -67,61 +72,59 @@ class Pinger(object):
             type, code, checksum, packet_ID, sequence = struct.unpack(
                 "bbHHh", icmp_header
             )
-            print(type, code)
             if packet_ID == ID:
                 bytes_In_double = struct.calcsize("d")
                 time_sent = struct.unpack("d", recv_packet[28:28 + bytes_In_double])[0]
                 return time_received - time_sent
-     
+
             time_remaining = time_remaining - time_spent
             if time_remaining <= 0:
                 return
 
-    def receive_from_hosts(self, socks, ips, my_id, timeout):
-        time_remaining = timeout
-        delays = []
-        rcv_hosts = set()
+    def receive_from_hosts(self, socks, ips, my_id):
+        time_remaining = self.timeout
+        active_hosts = set()
         while time_remaining > 0:
             start_time = time.time()
             readable, writable, error = select.select(socks, [], [], time_remaining)
             time_spent = (time.time() - start_time)
             if not readable:
-                return delays
+                return active_hosts
 
             for sock in readable:
                 time_received = time.time()
                 recv_packet, addr = sock.recvfrom(1024)
-                rcv_hosts.add(addr[0])
-                # print(rcv_hosts)
+                if self.sock_map[sock] != addr[0]:
+                    continue
                 icmp_header = recv_packet[20:28]
                 _type, code, checksum, packet_id, sequence = struct.unpack(
                     "bbHHh", icmp_header
                 )
                 if packet_id == my_id:
                     bytes_in_double = struct.calcsize("d")
-                    time_sent = struct.unpack("d", recv_packet[28:28+bytes_in_double])[0]
+                    time_sent = struct.unpack("d", recv_packet[28:28 + bytes_in_double])[0]
                     delay = time_received - time_sent
                     print("get pong from %s in %.4fms" % (addr[0], delay * 1000))
-                    delays.append(delay)
+                    active_hosts.add(addr[0])
 
             time_remaining = time_remaining - time_spent
-            if ips == rcv_hosts:
-                return delays
+            if ips == active_hosts:
+                return active_hosts
 
-    def send_ping(self, sock,  ID):
+    def send_ping(self, sock, ID, target_host):
         """
         Send ping to the target host
         """
-        target_addr = socket.gethostbyname(self.target_host)
-     
+        target_addr = socket.gethostbyname(target_host)
+
         my_checksum = 0
-     
+
         # Create a dummy heder with a 0 checksum.
         header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, my_checksum, ID, 1)
         bytes_In_double = struct.calcsize("d")
         data = (192 - bytes_In_double) * "Q"
         data = struct.pack("d", time.time()) + data
-     
+
         # Get the checksum on the data and the dummy header.
         my_checksum = self.do_checksum(header + data)
         header = struct.pack(
@@ -143,7 +146,7 @@ class Pinger(object):
         packet = header + data
         return packet
 
-    def ping_once(self):
+    def ping_once(self, host):
         """
         Returns the delay (in seconds) or none on timeout.
         """
@@ -158,66 +161,178 @@ class Pinger(object):
                 raise socket.error(msg)
             raise
         except Exception as e:
-            print("Exception: %s" %(e,))
+            print("Exception: %s" % (e,))
             raise
-    
+
         my_ID = os.getpid() & 0xFFFF
-     
-        self.send_ping(sock, my_ID)
+
+        self.send_ping(sock, my_ID, host)
         delay = self.receive_pong(sock, my_ID, self.timeout)
         sock.close()
         return delay
 
-    def ping_multi(self, hosts):
+    def icmp_echo_handler(self, sock, events):
+        """
+        处理ICMP响应的回调函数
+        :param sock:
+        :param events:
+        :return:
+        """
+        # print(events, events==tornado.ioloop.IOLoop.READ)
+        time_received = time.time()
+        recv_packet, addr = sock.recvfrom(1024)
+        if self.sock_map[sock] != addr[0]:
+            return
+        self.active_hosts.add(addr[0])
+        icmp_header = recv_packet[20:28]
+        _type, code, checksum, packet_id, sequence = struct.unpack(
+            "bbHHh", icmp_header
+        )
+        if packet_id == self.packet_id:
+            bytes_in_double = struct.calcsize("d")
+            time_sent = struct.unpack("d", recv_packet[28:28+bytes_in_double])[0]
+            delay = time_received - time_sent
+            print("get pong from %s in %.4fms" % (addr[0], delay * 1000))
+
+    def ping_multi_by_select(self, hosts):
         icmp = socket.getprotobyname("icmp")
         my_id = os.getpid() & 0xFFFF
-
         socks = []
         ips = set()
+        self.sock_map = {}
         for host in hosts:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, icmp)
             sock.setblocking(False)
             target_addr = socket.gethostbyname(host)
+            self.sock_map[sock] = target_addr
             ips.add(target_addr)
             packet = self.get_packet(my_id)
             sock.sendto(packet, (target_addr, 1))
             socks.append(sock)
 
-        delays = self.receive_from_hosts(socks, ips, my_id, self.timeout)
+        active_hosts = self.receive_from_hosts(socks, ips, my_id)
+        for sock in socks:
+            sock.close()
+        return active_hosts
+
+    def ping_multi_by_epoll(self, hosts):
+        icmp = socket.getprotobyname("icmp")
+        my_id = os.getpid() & 0xFFFF
+
+        io_loop = tornado.ioloop.IOLoop.current()
+
+        self.active_hosts = set()
+        socks = []
+        self.sock_map = {}
+        for host in hosts:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, icmp)
+            sock.setblocking(False)
+            socks.append(sock)
+            target_addr = socket.gethostbyname(host)
+            self.sock_map[sock] = target_addr
+            packet = self.get_packet(my_id)
+            io_loop.add_handler(sock, self.icmp_echo_handler, io_loop.READ)
+            sock.sendto(packet, (target_addr, 1))
+            self.packet_id = my_id
+
+        io_loop.add_timeout(time.time()+self.timeout, io_loop.stop)
+        io_loop.start()
+
         for sock in socks:
             sock.close()
 
-        # sock.close()
-        return delays
+        return self.active_hosts
 
-    def ping(self):
+    def ping(self, target_host):
         """
         Run the ping process
         """
         for i in range(self.count):
-            print("Ping to %s..." % self.target_host)
+            print("Ping to %s..." % target_host)
             try:
-                delay = self.ping_once()
+                delay = self.ping_once(target_host)
             except socket.gaierror as e:
                 print("Ping failed. (socket error: '%s')" % e)
                 break
-     
+
             if delay is None:
                 print("Ping failed. (timeout within %ssec.)" % self.timeout)
             else:
                 delay = delay * 1000
                 print("Get pong in %0.4fms" % delay)
- 
- 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Python ping')
-    parser.add_argument('--target-host', action="store", dest="target_host", required=True)
-    given_args = parser.parse_args()  
-    target_host = given_args.target_host
-    pinger = Pinger(target_host=target_host)
-    # pinger.ping()
 
+
+local_data = threading.local()
+
+
+class PingThread(threading.Thread):
+    def __init__(self, queue, out_queue):
+        super(PingThread, self).__init__()
+        self.queue = queue
+        self.out_queue = out_queue
+
+    def run(self):
+        while True:
+            try:
+                local_data.target_host = self.queue.get(timeout=10)
+            except Queue.Empty:
+                return
+            local_data.ret = subprocess.call("ping -c 1 -w 2 %s" % local_data.target_host, shell=True, stdout=subprocess.PIPE)
+            if not local_data.ret:
+                self.out_queue.put(local_data.target_host)
+            self.queue.task_done()
+
+
+def check(ips):
+    queue = Queue.Queue()
+    out_queue = Queue.Queue()
+
+    for i in range(100):
+        t = PingThread(queue, out_queue)
+        t.setDaemon(True)
+        t.start()
+    for ip in ips:
+        queue.put(ip)
+    queue.join()
+
+    active_hosts = set()
+    while True:
+        try:
+            host = out_queue.get(block=False)
+        except Queue.Empty:
+            break
+        active_hosts.add(host)
+        out_queue.task_done()
+    return active_hosts
+
+
+def check_async(ips):
+    pinger = Pinger()
+    active_hosts = pinger.ping_multi_by_epoll(ips)
+    return active_hosts
+
+
+if __name__ == '__main__':
+    # with open("ip.txt", 'r') as f:
+    #     ip_list = (line.strip() for line in f)
+    #     print(len(check(ip_list)))
+    ips = []
+    for i in range(1, 255):
+        ip = "192.168.30.{}".format(i)
+        ips.append(ip)
+    # hosts1 = check(ips)
+    # hosts2 = check_async(ips)
+    # print(sorted(list(hosts1)) == sorted(list(hosts2)))
+    pinger = Pinger()
     time1 = time.time()
-    pinger.ping_multi(["www.baidu.com", "www.qq.com", "www.163.com"])
+    hosts1 = pinger.ping_multi_by_epoll(ips)
+    hosts2 = pinger.ping_multi_by_select(ips)
     time2 = time.time()
     print((time2-time1) * 1000)
+    print(len(hosts1), len(hosts2))
+    print(sorted(list(hosts1)) == sorted(list(hosts2)))
+    # for host in (hosts2 - hosts1):
+    #     print(host)
+
+    # pinger = Pinger(sys.argv[1])
+    # print pinger.ping()
