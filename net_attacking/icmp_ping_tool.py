@@ -30,6 +30,11 @@ class Pinger(object):
     def __init__(self, count=DEFAULT_COUNT, timeout=DEFAULT_TIMEOUT):
         self.count = count
         self.timeout = timeout
+        self.io_loop = tornado.ioloop.IOLoop.current()
+        self.active_hosts = set()
+        self.ips = set()
+        self.sock_map = {}
+        self.packet_id = os.getpid() & 0xFFFF
 
     def do_checksum(self, source_string):
         """  Verify the packet integritity """
@@ -38,18 +43,18 @@ class Pinger(object):
         count = 0
         while count < max_count:
             val = ord(source_string[count + 1]) * 256 + ord(source_string[count])
-            sum = sum + val
-            sum = sum & 0xffffffff
-            count = count + 2
+            sum += val
+            sum &= 0xffffffff
+            count += 2
 
         if max_count < len(source_string):
-            sum = sum + ord(source_string[len(source_string) - 1])
-            sum = sum & 0xffffffff
+            sum += ord(source_string[len(source_string) - 1])
+            sum &= 0xffffffff
 
         sum = (sum >> 16) + (sum & 0xffff)
-        sum = sum + (sum >> 16)
+        sum += (sum >> 16)
         answer = ~sum
-        answer = answer & 0xffff
+        answer &= 0xffff
         answer = answer >> 8 | (answer << 8 & 0xff00)
         return answer
 
@@ -81,7 +86,7 @@ class Pinger(object):
             if time_remaining <= 0:
                 return
 
-    def receive_from_hosts(self, socks, ips, my_id):
+    def receive_from_hosts(self, socks, ips):
         time_remaining = self.timeout
         active_hosts = set()
         while time_remaining > 0:
@@ -100,7 +105,7 @@ class Pinger(object):
                 _type, code, checksum, packet_id, sequence = struct.unpack(
                     "bbHHh", icmp_header
                 )
-                if packet_id == my_id:
+                if packet_id == self.packet_id:
                     bytes_in_double = struct.calcsize("d")
                     time_sent = struct.unpack("d", recv_packet[28:28 + bytes_in_double])[0]
                     delay = time_received - time_sent
@@ -133,15 +138,15 @@ class Pinger(object):
         packet = header + data
         sock.sendto(packet, (target_addr, 1))
 
-    def get_packet(self, my_id):
+    def get_packet(self):
         my_checksum = 0
-        header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, my_checksum, my_id, 1)
+        header = struct.pack("bbHHh", ICMP_ECHO_REQUEST, 0, my_checksum, self.packet_id, 1)
         bytes_in_double = struct.calcsize("d")
         data = (192 - bytes_in_double) * "Q"
         data = struct.pack("d", time.time()) + data
         my_checksum = self.do_checksum(header + data)
         header = struct.pack(
-            "bbHHh", ICMP_ECHO_REQUEST, 0, socket.htons(my_checksum), my_id, 1
+            "bbHHh", ICMP_ECHO_REQUEST, 0, socket.htons(my_checksum), self.packet_id, 1
         )
         packet = header + data
         return packet
@@ -178,7 +183,6 @@ class Pinger(object):
         :param events:
         :return:
         """
-        # print(events, events==tornado.ioloop.IOLoop.READ)
         time_received = time.time()
         recv_packet, addr = sock.recvfrom(1024)
         if self.sock_map[sock] != addr[0]:
@@ -193,10 +197,13 @@ class Pinger(object):
             time_sent = struct.unpack("d", recv_packet[28:28+bytes_in_double])[0]
             delay = time_received - time_sent
             print("get pong from %s in %.4fms" % (addr[0], delay * 1000))
+            if self.active_hosts == self.ips:
+                self.io_loop.stop()
 
     def ping_multi_by_select(self, hosts):
         icmp = socket.getprotobyname("icmp")
-        my_id = os.getpid() & 0xFFFF
+        packet = self.get_packet()
+
         socks = []
         ips = set()
         self.sock_map = {}
@@ -206,37 +213,31 @@ class Pinger(object):
             target_addr = socket.gethostbyname(host)
             self.sock_map[sock] = target_addr
             ips.add(target_addr)
-            packet = self.get_packet(my_id)
             sock.sendto(packet, (target_addr, 1))
             socks.append(sock)
 
-        active_hosts = self.receive_from_hosts(socks, ips, my_id)
+        active_hosts = self.receive_from_hosts(socks, ips)
         for sock in socks:
             sock.close()
         return active_hosts
 
     def ping_multi_by_epoll(self, hosts):
         icmp = socket.getprotobyname("icmp")
-        my_id = os.getpid() & 0xFFFF
+        packet = self.get_packet()
 
-        io_loop = tornado.ioloop.IOLoop.current()
-
-        self.active_hosts = set()
         socks = []
-        self.sock_map = {}
         for host in hosts:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, icmp)
             sock.setblocking(False)
             socks.append(sock)
             target_addr = socket.gethostbyname(host)
             self.sock_map[sock] = target_addr
-            packet = self.get_packet(my_id)
-            io_loop.add_handler(sock, self.icmp_echo_handler, io_loop.READ)
+            self.ips.add(target_addr)
+            self.io_loop.add_handler(sock, self.icmp_echo_handler, self.io_loop.READ)
             sock.sendto(packet, (target_addr, 1))
-            self.packet_id = my_id
 
-        io_loop.add_timeout(time.time()+self.timeout, io_loop.stop)
-        io_loop.start()
+        self.io_loop.add_timeout(time.time()+self.timeout, self.io_loop.stop)
+        self.io_loop.start()
 
         for sock in socks:
             sock.close()
@@ -324,15 +325,13 @@ if __name__ == '__main__':
     # hosts2 = check_async(ips)
     # print(sorted(list(hosts1)) == sorted(list(hosts2)))
     pinger = Pinger()
+    ips = ['www.baidu.com', 'www.163.com', 'www.qq.com', 'www.google.com']
     time1 = time.time()
     hosts1 = pinger.ping_multi_by_epoll(ips)
-    hosts2 = pinger.ping_multi_by_select(ips)
+    #hosts2 = pinger.ping_multi_by_select(ips)
     time2 = time.time()
     print((time2-time1) * 1000)
-    print(len(hosts1), len(hosts2))
-    print(sorted(list(hosts1)) == sorted(list(hosts2)))
+    #print(len(hosts1), len(hosts2))
+    #print(sorted(list(hosts1)) == sorted(list(hosts2)))
     # for host in (hosts2 - hosts1):
     #     print(host)
-
-    # pinger = Pinger(sys.argv[1])
-    # print pinger.ping()
