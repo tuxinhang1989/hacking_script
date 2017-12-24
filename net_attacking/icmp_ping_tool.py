@@ -197,6 +197,8 @@ class Pinger(object):
             time_sent = struct.unpack("d", recv_packet[28:28+bytes_in_double])[0]
             delay = time_received - time_sent
             print("get pong from %s in %.4fms" % (addr[0], delay * 1000))
+            self.io_loop.remove_handler(sock)
+            sock.close()
             if self.active_hosts == self.ips:
                 self.io_loop.stop()
 
@@ -225,22 +227,18 @@ class Pinger(object):
         icmp = socket.getprotobyname("icmp")
         packet = self.get_packet()
 
-        socks = []
         for host in hosts:
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, icmp)
             sock.setblocking(False)
-            socks.append(sock)
             target_addr = socket.gethostbyname(host)
             self.sock_map[sock] = target_addr
             self.ips.add(target_addr)
             self.io_loop.add_handler(sock, self.icmp_echo_handler, self.io_loop.READ)
+            #print("ping to %s..." % target_addr)
             sock.sendto(packet, (target_addr, 1))
 
         self.io_loop.add_timeout(time.time()+self.timeout, self.io_loop.stop)
         self.io_loop.start()
-
-        for sock in socks:
-            sock.close()
 
         return self.active_hosts
 
@@ -318,8 +316,8 @@ if __name__ == '__main__':
     #     ip_list = (line.strip() for line in f)
     #     print(len(check(ip_list)))
     ips = []
-    for i in range(1, 255):
-        ip = "192.168.30.{}".format(i)
+    for i in range(1, 25):
+        ip = "192.168.0.{}".format(i)
         ips.append(ip)
     # hosts1 = check(ips)
     # hosts2 = check_async(ips)
